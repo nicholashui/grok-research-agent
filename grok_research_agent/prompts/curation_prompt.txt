@@ -1,0 +1,18 @@
+You will curate sources based on the user's instruction.
+
+Topic: {{topic}}
+
+Discovery table:
+{{discovery_table}}
+
+User instruction:
+{{selection}}
+
+Output JSON only. It must be a list of objects with keys:
+- title
+- url
+- type
+- why_relevant
+- credibility
+- priority
+

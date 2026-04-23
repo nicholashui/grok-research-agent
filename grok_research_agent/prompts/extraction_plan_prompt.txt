@@ -1,0 +1,9 @@
+You will propose a short extraction plan for each curated source.
+
+Topic: {{topic}}
+
+Curated sources JSON:
+{{curated_sources_json}}
+
+Output Markdown with a numbered list mapping source -> what to extract.
+

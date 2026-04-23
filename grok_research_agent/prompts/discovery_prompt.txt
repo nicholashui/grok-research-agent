@@ -1,0 +1,11 @@
+You will produce a comprehensive discovery table of sources for the topic.
+
+Topic: {{topic}}
+Focus: {{focus}}
+Since last run: {{since_last_run}}
+
+Return a Markdown table exactly in this format:
+| Type | Title | URL | Why Relevant | Credibility (1-5) | Short TL;DR | Priority (High/Med/Low) |
+
+Prioritize recent sources (2024-2026 when possible). Mix official docs, academic papers, GitHub repos, blog posts, and talks.
+

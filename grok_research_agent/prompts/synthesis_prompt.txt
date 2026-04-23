@@ -1,0 +1,13 @@
+You will synthesize a draft report.
+
+Topic: {{topic}}
+
+Notebook:
+{{notebook}}
+
+Output Markdown with:
+- Executive summary
+- Table of contents
+- Draft sections with inline numeric citations like [1], [2]
+- Final References section mapping numbers to URLs
+

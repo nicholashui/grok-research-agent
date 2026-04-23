@@ -1,0 +1,11 @@
+You will help refine a research scope.
+
+Topic: {{topic}}
+Focus areas (optional): {{focus}}
+
+Output a concise Markdown scope summary with:
+- What the report will cover
+- What it will not cover
+- Key questions to answer
+- Target depth and audience
+

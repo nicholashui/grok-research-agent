@@ -1,0 +1,7 @@
+Generate image prompts suitable for Grok Imagine from the report below.
+
+Report:
+{{report}}
+
+Output Markdown with 5-10 image prompts.
+

@@ -1,0 +1,12 @@
+You will merge extracted notes into a living knowledge base.
+
+Topic: {{topic}}
+
+Extractions (multiple sources):
+{{extractions}}
+
+Output Markdown as 04_master_notebook.md with:
+- Grouped sections (Definitions, Architecture, Case Studies, Tools, Open Questions)
+- Contradictions section
+- Cross references
+

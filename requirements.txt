@@ -1,0 +1,10 @@
+openai>=1.30.0
+python-dotenv
+rich
+pydantic>=2
+tiktoken
+pypdf
+requests
+beautifulsoup4
+readability-lxml
+chardet<6

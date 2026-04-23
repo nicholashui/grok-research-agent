@@ -1,0 +1,12 @@
+You will analyze the curated sources for coverage gaps.
+
+Topic: {{topic}}
+
+Curated sources JSON:
+{{curated_sources_json}}
+
+Output a short Markdown gap report with:
+- Missing subtopics
+- Suggested additional source types to include
+- Any contradictions to watch for
+

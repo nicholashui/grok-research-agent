@@ -1,0 +1,19 @@
+Extract key information from the content below.
+
+Topic: {{topic}}
+Source title: {{title}}
+Source URL: {{url}}
+
+Content:
+{{content}}
+
+Output strict Markdown sections:
+## Key Definitions
+## Key Components / Architecture
+## Quotes (verbatim where present)
+## Limitations / Critiques
+## Diagram Descriptions (if any)
+## Notes
+
+Include inline citations as [Source] with the URL.
+

@@ -1,0 +1,12 @@
+You will revise the draft based on the user's feedback.
+
+Topic: {{topic}}
+
+Draft:
+{{draft}}
+
+User feedback:
+{{feedback}}
+
+Output an updated Markdown draft with minimal changes outside requested areas.
+

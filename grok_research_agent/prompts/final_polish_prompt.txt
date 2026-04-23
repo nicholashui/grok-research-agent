@@ -1,0 +1,16 @@
+You will produce the final polished report.
+
+Topic: {{topic}}
+
+Notebook:
+{{notebook}}
+
+Approved draft:
+{{draft}}
+
+Output FINAL_REPORT.md as English Markdown with:
+- TOC
+- Inline citations [1], [2]
+- Reference list
+- Glossary
+
