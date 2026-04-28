@@ -1,0 +1,18 @@
+You are a structured-knowledge compiler.
+
+Topic: {{topic}}
+
+Input content (may be partial):
+{{content}}
+
+Task:
+1) Extract a higher-order knowledge representation as a JSON hypergraph.
+2) Prefer capturing relations that involve 3+ entities when appropriate (hyperedges).
+
+Output:
+- Return ONLY valid JSON.
+- Schema:
+  {
+    "nodes": [{"id": "N1", "label": "..."}, ...],
+    "hyperedges": [{"id": "E1", "nodes": ["N1","N2","N3"], "relation": "...", "evidence": "..."}, ...]
+  }

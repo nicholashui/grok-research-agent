@@ -14,3 +14,9 @@ def test_cli_list_sessions(tmp_path: Path, capsys: object) -> None:
     out = capsys.readouterr().out
     assert s.session_id in out
 
+
+def test_cli_list_types(capsys: object) -> None:
+    rc = main(["list-types"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "auto-hypergraph" in out

@@ -19,6 +19,7 @@ class SessionState(BaseModel):
     session_id: str
     topic: str
     focus: str | None = None
+    mode: str = "report"
     created_at: str
     grok_model: str
     current_phase: int = 0
@@ -31,6 +32,19 @@ class SessionPaths:
     session_dir: Path
     state_path: Path
     runs_dir: Path
+    knowledge_base_dir: Path
+
+
+@dataclass(frozen=True)
+class KnowledgeBasePaths:
+    base_dir: Path
+    auto_types_dir: Path
+    feed_docs_dir: Path
+    hypergraph_path: Path
+    core_concepts_path: Path
+    drill_questions_path: Path
+    drill_pack_path: Path
+    mermaid_path: Path
 
 
 class SessionManager:
@@ -44,7 +58,7 @@ class SessionManager:
     def _default_model(self) -> str:
         return "grok-3"
 
-    def create_session(self, topic: str, focus: str | None) -> SessionState:
+    def create_session(self, topic: str, focus: str | None, *, mode: str = "report") -> SessionState:
         date = datetime.now().strftime("%Y%m%d")
         base = f"{_slugify(topic)}-{date}"
         session_id = base
@@ -56,11 +70,13 @@ class SessionManager:
         session_dir = self.sessions_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=False)
         (session_dir / "runs").mkdir(parents=True, exist_ok=True)
+        self._ensure_knowledge_base_dirs(session_dir)
 
         state = SessionState(
             session_id=session_id,
             topic=topic,
             focus=focus,
+            mode=mode,
             created_at=self._now_iso(),
             grok_model=self._default_model(),
             current_phase=0,
@@ -76,6 +92,7 @@ class SessionManager:
             session_dir=session_dir,
             state_path=session_dir / "session.json",
             runs_dir=session_dir / "runs",
+            knowledge_base_dir=session_dir / "knowledge_base",
         )
 
     def load_state(self, session_id: str) -> SessionState:
@@ -87,6 +104,7 @@ class SessionManager:
         paths = self.session_paths(state.session_id)
         paths.session_dir.mkdir(parents=True, exist_ok=True)
         paths.runs_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_knowledge_base_dirs(paths.session_dir)
         state.updated_at = self._now_iso()  # type: ignore[misc]
         paths.state_path.write_text(
             json.dumps(state.model_dump(), indent=2, ensure_ascii=False),
@@ -113,6 +131,28 @@ class SessionManager:
             if (p / "session.json").exists():
                 sessions.append(p.name)
         return sessions
+
+    def knowledge_base_paths(self, session_id: str) -> KnowledgeBasePaths:
+        session_dir = self.sessions_dir / session_id
+        self._ensure_knowledge_base_dirs(session_dir)
+        base_dir = session_dir / "knowledge_base"
+        auto_types_dir = base_dir / "auto_types"
+        feed_docs_dir = base_dir / "feed_docs"
+        return KnowledgeBasePaths(
+            base_dir=base_dir,
+            auto_types_dir=auto_types_dir,
+            feed_docs_dir=feed_docs_dir,
+            hypergraph_path=base_dir / "hypergraph.json",
+            core_concepts_path=base_dir / "core_concepts.json",
+            drill_questions_path=base_dir / "drill_questions.json",
+            drill_pack_path=base_dir / "drill_pack.md",
+            mermaid_path=base_dir / "hypergraph.mmd",
+        )
+
+    def _ensure_knowledge_base_dirs(self, session_dir: Path) -> None:
+        base = session_dir / "knowledge_base"
+        (base / "auto_types").mkdir(parents=True, exist_ok=True)
+        (base / "feed_docs").mkdir(parents=True, exist_ok=True)
 
     def read_json(self, path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))

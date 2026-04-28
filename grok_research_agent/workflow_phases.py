@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -23,6 +25,17 @@ class WorkflowContext:
 
 
 class WorkflowRunner:
+    AUTO_TYPES: tuple[str, ...] = (
+        "auto-model",
+        "auto-list",
+        "auto-set",
+        "auto-graph",
+        "auto-hypergraph",
+        "auto-temporal-graph",
+        "auto-spatial-graph",
+        "auto-spatiotemporal-graph",
+    )
+
     def __init__(
         self,
         session_manager: SessionManager,
@@ -36,7 +49,7 @@ class WorkflowRunner:
         self._client_factory = client_factory
         self._http_get = http_get or requests.get
 
-    def run(self, session_id: str, command: str | None = None) -> None:
+    def run(self, session_id: str, command: str | None = None, **options: object) -> None:
         state = self.session_manager.load_state(session_id)
         paths = self.session_manager.session_paths(session_id)
         run_dir = self.session_manager.create_run_dir(session_id)
@@ -62,6 +75,28 @@ class WorkflowRunner:
             ctx.state.current_phase = 2
             self.session_manager.save_state(ctx.state)
             self.console.print("Update discovery completed. Resume to curate sources (H1).")
+            return
+
+        if command == "compile":
+            compile_type = str(options.get("compile_type") or "auto-hypergraph")
+            self._compile(ctx, compile_type=compile_type)
+            return
+
+        if command == "drill":
+            drill_mode = str(options.get("drill_mode") or "backward")
+            self._drill(ctx, drill_mode=drill_mode)
+            return
+
+        if command == "feed":
+            new_doc = options.get("new_doc")
+            if not new_doc:
+                self.console.print("Missing --new-doc")
+                return
+            self._feed(ctx, Path(str(new_doc)))
+            return
+
+        if command == "show":
+            self._show(ctx)
             return
 
         self._run_until_human_step(ctx)
@@ -119,6 +154,182 @@ class WorkflowRunner:
     def _write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    def _strip_code_fences(self, text: str) -> str:
+        t = text.strip()
+        if t.startswith("```"):
+            lines = t.splitlines()
+            if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].startswith("```"):
+                return "\n".join(lines[1:-1]).strip()
+        return t
+
+    def _safe_json(self, text: str) -> dict[str, object]:
+        cleaned = self._strip_code_fences(text)
+        try:
+            obj = json.loads(cleaned)
+            if isinstance(obj, dict):
+                return obj
+            return {"data": obj}
+        except Exception:  # noqa: BLE001
+            return {"raw": cleaned}
+
+    def _compiler_source(self, ctx: WorkflowContext) -> str | None:
+        notebook = ctx.session_dir / "04_master_notebook.md"
+        if notebook.exists():
+            try:
+                return notebook.read_text(encoding="utf-8")
+            except OSError as e:
+                self.console.print(f"[yellow]Unable to read notebook:[/yellow] {notebook} ({e})")
+        extracted_dir = ctx.session_dir / "03_extracted"
+        if extracted_dir.exists():
+            parts: list[str] = []
+            try:
+                extracted_files = sorted(extracted_dir.glob("*.md"))
+            except OSError as e:
+                self.console.print(f"[yellow]Unable to list extracted files:[/yellow] {extracted_dir} ({e})")
+                return None
+            for p in extracted_files:
+                try:
+                    parts.append(p.read_text(encoding="utf-8"))
+                except OSError as e:
+                    self.console.print(f"[yellow]Unable to read extracted file:[/yellow] {p} ({e})")
+            if parts:
+                return "\n\n---\n\n".join(parts)
+        return None
+
+    def _compile(self, ctx: WorkflowContext, *, compile_type: str = "auto-hypergraph") -> None:
+        if compile_type not in self.AUTO_TYPES:
+            if compile_type != "auto-hypergraph":
+                self.console.print(f"Unknown type: {compile_type}")
+                return
+        source = self._compiler_source(ctx)
+        if not source:
+            self.console.print("Missing notebook or extractions. Resume the session to generate them first.")
+            return
+        client = self._client(ctx)
+        kb = self.session_manager.knowledge_base_paths(ctx.state.session_id)
+
+        hg_template = client.prompt_from_file(ctx.prompts_dir / "compile_auto_hypergraph_prompt.txt")
+        hg_prompt = client.render_template(
+            hg_template,
+            {
+                "topic": ctx.state.topic,
+                "content": source[:220000],
+            },
+        )
+        hg_text = client.chat_text(system="You are Grok.", user=hg_prompt)
+        hg_data = self._safe_json(hg_text)
+        self.session_manager.write_json(kb.auto_types_dir / "auto_hypergraph.json", hg_data)
+        self.session_manager.write_json(kb.hypergraph_path, hg_data)
+
+        concepts_template = client.prompt_from_file(ctx.prompts_dir / "core_concepts_prompt.txt")
+        concepts_prompt = client.render_template(
+            concepts_template,
+            {
+                "topic": ctx.state.topic,
+                "content": source[:220000],
+                "hypergraph_json": json.dumps(hg_data, ensure_ascii=False)[:120000],
+            },
+        )
+        concepts_text = client.chat_text(system="You are Grok.", user=concepts_prompt)
+        concepts_data = self._safe_json(concepts_text)
+        self.session_manager.write_json(kb.core_concepts_path, concepts_data)
+        self.console.print(f"Saved knowledge base to {kb.base_dir}")
+
+    def _drill(self, ctx: WorkflowContext, *, drill_mode: str = "backward") -> None:
+        if drill_mode != "backward":
+            self.console.print(f"Unknown drill mode: {drill_mode}")
+            return
+        kb = self.session_manager.knowledge_base_paths(ctx.state.session_id)
+        if not kb.core_concepts_path.exists():
+            self._compile(ctx, compile_type="auto-hypergraph")
+        if not kb.core_concepts_path.exists():
+            self.console.print("Missing core concepts. Run compile first.")
+            return
+        core = kb.core_concepts_path.read_text(encoding="utf-8")
+        client = self._client(ctx)
+        template = client.prompt_from_file(ctx.prompts_dir / "drill_pack_prompt.txt")
+        prompt = client.render_template(
+            template,
+            {"topic": ctx.state.topic, "core_concepts_json": core[:200000]},
+        )
+        text = client.chat_text(system="You are Grok.", user=prompt)
+        data = self._safe_json(text)
+        drill_md = str(data.get("drill_pack_markdown") or "")
+        if not drill_md.strip():
+            drill_md = self._strip_code_fences(text)
+        self._write(kb.drill_pack_path, drill_md)
+        if "drill_questions" in data:
+            self.session_manager.write_json(kb.drill_questions_path, data.get("drill_questions"))
+        else:
+            self.session_manager.write_json(kb.drill_questions_path, data)
+        self.console.print(f"Saved drill pack to {kb.drill_pack_path}")
+
+    def _feed(self, ctx: WorkflowContext, new_doc: Path) -> None:
+        if not new_doc.exists() or not new_doc.is_file():
+            self.console.print(f"File not found: {new_doc}")
+            return
+        kb = self.session_manager.knowledge_base_paths(ctx.state.session_id)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        dest = kb.feed_docs_dir / f"{stamp}_{new_doc.name}"
+        self._write(dest, new_doc.read_text(encoding="utf-8", errors="replace"))
+        if not kb.hypergraph_path.exists():
+            self._compile(ctx, compile_type="auto-hypergraph")
+            return
+
+        existing = kb.hypergraph_path.read_text(encoding="utf-8")
+        client = self._client(ctx)
+        template = client.prompt_from_file(ctx.prompts_dir / "update_hypergraph_prompt.txt")
+        prompt = client.render_template(
+            template,
+            {
+                "topic": ctx.state.topic,
+                "existing_hypergraph_json": existing[:160000],
+                "new_document": dest.read_text(encoding="utf-8")[:160000],
+            },
+        )
+        updated_text = client.chat_text(system="You are Grok.", user=prompt)
+        updated = self._safe_json(updated_text)
+        self.session_manager.write_json(kb.hypergraph_path, updated)
+        self.session_manager.write_json(kb.auto_types_dir / "auto_hypergraph.json", updated)
+        self.console.print(f"Updated hypergraph at {kb.hypergraph_path}")
+
+    def _show(self, ctx: WorkflowContext) -> None:
+        kb = self.session_manager.knowledge_base_paths(ctx.state.session_id)
+        if not kb.hypergraph_path.exists():
+            self.console.print("Missing hypergraph.json. Run compile first.")
+            return
+        data = self._safe_json(kb.hypergraph_path.read_text(encoding="utf-8"))
+        mermaid = self._hypergraph_to_mermaid(data)
+        self._write(kb.mermaid_path, mermaid)
+        self.console.print(f"Saved Mermaid to {kb.mermaid_path}")
+
+    def _hypergraph_to_mermaid(self, data: dict[str, object]) -> str:
+        nodes = data.get("nodes")
+        edges = data.get("edges") or data.get("hyperedges")
+        lines: list[str] = ["graph TD"]
+        if isinstance(nodes, list):
+            for n in nodes[:200]:
+                if isinstance(n, dict):
+                    nid = str(n.get("id") or n.get("name") or "").strip()
+                    label = str(n.get("label") or nid).strip()
+                    if nid:
+                        lines.append(f'  {nid}["{label}"]')
+        if isinstance(edges, list):
+            for e in edges[:400]:
+                if not isinstance(e, dict):
+                    continue
+                rel = str(e.get("relation") or e.get("label") or "").strip()
+                members = e.get("nodes") or e.get("members") or e.get("participants")
+                if isinstance(members, list) and len(members) >= 2:
+                    a = str(members[0]).strip()
+                    b = str(members[1]).strip()
+                    if a and b:
+                        if rel:
+                            lines.append(f"  {a} -->|{rel}| {b}")
+                        else:
+                            lines.append(f"  {a} --> {b}")
+        return "\n".join(lines) + "\n"
 
     def _phase0_scope(self, ctx: WorkflowContext) -> None:
         try:

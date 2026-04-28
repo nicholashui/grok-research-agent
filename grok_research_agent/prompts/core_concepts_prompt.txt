@@ -1,0 +1,23 @@
+You are extracting load-bearing concepts for deep study.
+
+Topic: {{topic}}
+
+Hypergraph (JSON, may be partial):
+{{hypergraph_json}}
+
+Input content (may be partial):
+{{content}}
+
+Task:
+- Identify exactly 7 non-negotiable load-bearing core concepts.
+- For each: provide a short definition and explain why it is load-bearing.
+
+Output:
+- Return ONLY valid JSON.
+- Schema:
+  {
+    "core_concepts": [
+      {"name": "...", "definition": "...", "why_load_bearing": "..."},
+      ...
+    ]
+  }

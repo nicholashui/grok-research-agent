@@ -1,0 +1,27 @@
+You are generating a backward drill pack for exam-level mastery.
+
+Topic: {{topic}}
+
+Core concepts (JSON):
+{{core_concepts_json}}
+
+Task:
+- For each core concept: write 3 hardest realistic professor-level exam questions.
+- Provide perfect model answers.
+- Provide common pitfalls and how to avoid them.
+- Make output Anki-friendly.
+
+Output:
+- Return ONLY valid JSON.
+- Schema:
+  {
+    "drill_pack_markdown": "markdown string",
+    "drill_questions": [
+      {
+        "concept": "...",
+        "questions": [
+          {"question": "...", "answer": "...", "pitfalls": ["...", "..."]}
+        ]
+      }
+    ]
+  }

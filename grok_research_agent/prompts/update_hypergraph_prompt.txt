@@ -1,0 +1,16 @@
+You are updating an existing JSON hypergraph with a new document.
+
+Topic: {{topic}}
+
+Existing hypergraph (JSON):
+{{existing_hypergraph_json}}
+
+New document:
+{{new_document}}
+
+Task:
+- Update nodes and hyperedges to incorporate new information.
+- Reuse existing node ids where possible; otherwise introduce new ids.
+
+Output:
+- Return ONLY valid JSON in the same schema as the existing hypergraph.

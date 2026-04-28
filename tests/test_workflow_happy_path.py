@@ -116,3 +116,49 @@ def test_full_workflow_happy_path(tmp_path: Path, monkeypatch: Any) -> None:
     assert (sessions_dir / session.session_id / "FINAL_REPORT.md").exists()
     assert (sessions_dir / session.session_id / "images_to_generate.md").exists()
 
+
+def test_compile_and_drill_outputs(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    manager = SessionManager(sessions_dir=sessions_dir)
+    session = manager.create_session(topic="Test Topic", focus=None)
+    session_dir = sessions_dir / session.session_id
+    (session_dir / "04_master_notebook.md").write_text("# Notebook\nContent", encoding="utf-8")
+
+    fake_replies = [
+        json.dumps(
+            {
+                "nodes": [{"id": "N1", "label": "Concept A"}, {"id": "N2", "label": "Concept B"}],
+                "hyperedges": [{"id": "E1", "nodes": ["N1", "N2"], "relation": "rel", "evidence": "x"}],
+            }
+        ),
+        json.dumps(
+            {
+                "core_concepts": [
+                    {"name": f"C{i}", "definition": "d", "why_load_bearing": "w"} for i in range(1, 8)
+                ]
+            }
+        ),
+        json.dumps(
+            {
+                "drill_pack_markdown": "# Drill Pack\n",
+                "drill_questions": [{"concept": "C1", "questions": [{"question": "q", "answer": "a", "pitfalls": []}]}],
+            }
+        ),
+    ]
+    fake_client = FakeGrokClient(fake_replies)
+
+    def client_factory(_: WorkflowContext) -> FakeGrokClient:
+        return fake_client
+
+    console = Console(file=None)
+    runner = WorkflowRunner(session_manager=manager, console=console, client_factory=client_factory)
+
+    runner.run(session.session_id, command="compile", compile_type="auto-hypergraph")
+    kb_dir = session_dir / "knowledge_base"
+    assert (kb_dir / "hypergraph.json").exists()
+    assert (kb_dir / "auto_types" / "auto_hypergraph.json").exists()
+    assert (kb_dir / "core_concepts.json").exists()
+
+    runner.run(session.session_id, command="drill", drill_mode="backward")
+    assert (kb_dir / "drill_pack.md").exists()
+    assert (kb_dir / "drill_questions.json").exists()

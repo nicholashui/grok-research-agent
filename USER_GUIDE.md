@@ -1,13 +1,13 @@
 # Grok-Powered Research Workflow Automation Tool
 
-Welcome to `grok-research-agent`, a powerful Python CLI that automates an 8-phase research workflow using the Grok (xAI) API. It turns raw topics into complete, citation-rich Markdown research reports while keeping you strictly in the loop at exactly four critical human interaction points.
+Welcome to `grok-research-agent`, a Python CLI that automates an 8-phase research workflow using the Grok (xAI) API. It turns raw topics into complete, citation-rich Markdown research reports while keeping you in the loop at four critical human interaction points. It also supports structured “knowledge compilation” outputs (hypergraph + core concepts) and a backward drill pack for studying.
 
 ## Features
 - **Automated Discovery**: Parallel reasoning to find sources across web, arXiv, GitHub, and more.
 - **Human-in-the-Loop**: You retain full control over scope, source curation, draft synthesis, and offline collection.
-- **Living Knowledge Base**: Automatically extracts and merges source data into a single master notebook.
+- **Living Knowledge Base**: Builds a master notebook and can compile structured knowledge outputs into `knowledge_base/`.
 - **Session Management**: Supports saving and resuming sessions, so your research can span multiple runs.
-- **Markdown Export**: Everything is output as clean, usable Markdown files.
+- **Markdown Export**: Produces Markdown reports and study packs.
 
 ---
 
@@ -58,6 +58,11 @@ grok-research-agent start --topic "What is Harness Engineering on AI?" --focus "
 ```
 *The CLI will output a session ID (e.g., `what-is-harness-engineering-on-ai-20260326`).*
 
+You can also choose a session mode:
+```bash
+grok-research-agent start --topic "MIT 6.824" --mode compiler
+```
+
 ### Resuming a Session
 Because the tool stops at explicit human-in-the-loop steps, you will frequently use the `resume` command to advance to the next phase.
 
@@ -75,6 +80,26 @@ grok-research-agent list-sessions
 - **Force Synthesis**: Generate a draft at any time from your current notebook.
   ```bash
   grok-research-agent synthesize --session-id <your-session-id>
+  ```
+- **Compile Knowledge Base**: Produce a structured hypergraph and 7 load-bearing core concepts (saved under `knowledge_base/`).
+  ```bash
+  grok-research-agent compile --session-id <your-session-id> --type auto-hypergraph
+  ```
+- **Generate Backward Drill Pack**: Builds `drill_pack.md` and drill questions from the core concepts.
+  ```bash
+  grok-research-agent drill --session-id <your-session-id> --mode backward
+  ```
+- **Feed New Document**: Add a new document (Markdown/text) to evolve the session hypergraph.
+  ```bash
+  grok-research-agent feed --session-id <your-session-id> --new-doc /path/to/doc.md
+  ```
+- **Show Hypergraph (Mermaid)**: Writes a Mermaid diagram file to `knowledge_base/hypergraph.mmd`.
+  ```bash
+  grok-research-agent show --session-id <your-session-id>
+  ```
+- **List Knowledge Types**:
+  ```bash
+  grok-research-agent list-types
   ```
 - **Generate Images**: Create Grok Imagine prompts based on your final report.
   ```bash
@@ -149,6 +174,15 @@ research_sessions/
     ├── 05_draft_v1.md
     ├── FINAL_REPORT.md
     ├── images_to_generate.md
+    ├── knowledge_base/
+    │   ├── hypergraph.json
+    │   ├── hypergraph.mmd
+    │   ├── core_concepts.json
+    │   ├── drill_pack.md
+    │   ├── drill_questions.json
+    │   ├── auto_types/
+    │   │   └── auto_hypergraph.json
+    │   └── feed_docs/
     └── runs/                   # Backups of intermediate states per run
 ```
 
