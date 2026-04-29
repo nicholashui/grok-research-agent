@@ -1,16 +1,20 @@
-You will produce the final polished report.
+You will generate an executive summary for a detailed research report.
 
 Topic: {{topic}}
 
-Notebook:
-{{notebook}}
+Source catalog:
+{{source_catalog}}
 
-Approved draft:
-{{draft}}
+Knowledge outline:
+{{knowledge_outline}}
 
-Output FINAL_REPORT.md as English Markdown with:
-- TOC
-- Inline citations [1], [2]
-- Reference list
-- Glossary
+Report body:
+{{report_body}}
 
+Output Markdown only for the executive summary body. Do not rewrite the full report.
+
+Requirements:
+- explain the main findings and why they matter
+- preserve important nuance, trade-offs, and risk areas
+- remain faithful to the detailed report body
+- avoid reducing the report to a shallow overview

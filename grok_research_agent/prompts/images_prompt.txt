@@ -5,3 +5,4 @@ Report:
 
 Output Markdown with 5-10 image prompts.
 
+Prefer prompts that visualize concrete mechanisms, workflows, architectures, comparisons, and evidence from the detailed report rather than generic concept art.

@@ -1,0 +1,25 @@
+You are writing one section of a detailed research report.
+
+Topic: {{topic}}
+Section: {{section_name}}
+
+Source catalog:
+{{source_catalog}}
+
+Knowledge-base context:
+{{knowledge_outline}}
+
+Evidence packets:
+{{section_evidence}}
+
+Write a detailed Markdown section with:
+- a `## {{section_name}}` heading
+- informative subheadings where helpful
+- dense, evidence-backed prose
+- inline numeric citations like [1], [2]
+- contradictions, trade-offs, and uncertainty where present
+
+Rules:
+- Preserve technical detail instead of collapsing it into a short summary.
+- Include mechanisms, steps, examples, and caveats when evidence exists.
+- If evidence is incomplete or conflicting, say so explicitly.

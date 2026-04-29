@@ -5,8 +5,8 @@ Topic: {{topic}}
 Curated sources JSON:
 {{curated_sources_json}}
 
-Output a short Markdown gap report with:
+Output a detailed Markdown gap report with:
 - Missing subtopics
 - Suggested additional source types to include
 - Any contradictions to watch for
-
+- Blind spots that would likely cause a shallow final report

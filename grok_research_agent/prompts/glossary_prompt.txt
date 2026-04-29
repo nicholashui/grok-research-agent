@@ -1,0 +1,17 @@
+You are generating a glossary for a detailed research report.
+
+Topic: {{topic}}
+
+Knowledge outline:
+{{knowledge_outline}}
+
+Report body:
+{{report_body}}
+
+Output Markdown only for glossary entries as a flat bullet list in this form:
+- Term: concise but precise explanation
+
+Rules:
+- Prefer terms that are central to understanding the report.
+- Keep definitions technically accurate and specific.
+- Do not repeat the full report or add unrelated commentary.

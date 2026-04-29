@@ -1,0 +1,24 @@
+You are extracting section-specific evidence from a detailed research notebook.
+
+Topic: {{topic}}
+Target section: {{section_name}}
+Notebook chunk: {{chunk_number}} / {{chunk_count}}
+
+Source catalog:
+{{source_catalog}}
+
+Notebook chunk:
+{{notebook_chunk}}
+
+Output Markdown with these sections:
+## Relevant Claims
+## Technical Details
+## Examples, Evidence, and Case Studies
+## Contradictions and Caveats
+## Gaps in This Chunk
+
+Rules:
+- Focus only on material relevant to the target section.
+- Preserve specific details, mechanisms, examples, numbers, and caveats.
+- Keep source references visible using the numeric refs already present in the notebook.
+- Do not write a polished essay yet; produce dense evidence notes for later drafting.

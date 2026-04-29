@@ -1,4 +1,4 @@
-You will synthesize a draft report.
+You will synthesize a detailed technical report draft.
 
 Topic: {{topic}}
 
@@ -6,8 +6,10 @@ Notebook:
 {{notebook}}
 
 Output Markdown with:
-- Executive summary
-- Table of contents
-- Draft sections with inline numeric citations like [1], [2]
-- Final References section mapping numbers to URLs
+- a thorough technical body, not just an executive summary
+- section-level depth with mechanisms, examples, trade-offs, and failure modes
+- inline numeric citations like [1], [2]
+- appendices or annex material when needed to preserve useful detail
+- a final References section mapping numbers to URLs
 
+Prefer completeness over brevity.

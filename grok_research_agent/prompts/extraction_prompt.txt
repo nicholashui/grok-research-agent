@@ -1,19 +1,27 @@
-Extract key information from the content below.
+Extract detailed, evidence-preserving notes from the source chunk below.
 
 Topic: {{topic}}
+Source reference: {{source_ref}}
 Source title: {{title}}
 Source URL: {{url}}
+Chunk: {{chunk_number}} / {{chunk_count}}
 
 Content:
 {{content}}
 
 Output strict Markdown sections:
-## Key Definitions
-## Key Components / Architecture
-## Quotes (verbatim where present)
-## Limitations / Critiques
-## Diagram Descriptions (if any)
-## Notes
+## Coverage Summary
+## Definitions and Terminology
+## Technical Mechanisms and Architecture
+## Process, Workflow, or Algorithm Details
+## Evidence, Examples, Metrics, and Experiments
+## Limitations, Trade-offs, and Critiques
+## Open Questions or Missing Details
+## Quotable Passages
+## Extraction Notes
 
-Include inline citations as [Source] with the URL.
-
+Rules:
+- Preserve specific details, steps, claims, numbers, examples, and caveats.
+- Do not reduce the chunk to a brief summary.
+- If the chunk is only partially relevant, state that and still capture any useful details.
+- Use inline citations like {{source_ref}}.

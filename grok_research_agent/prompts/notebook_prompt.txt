@@ -1,4 +1,4 @@
-You will merge extracted notes into a living knowledge base.
+You will assemble an evidence-preserving research notebook.
 
 Topic: {{topic}}
 
@@ -6,7 +6,10 @@ Extractions (multiple sources):
 {{extractions}}
 
 Output Markdown as 04_master_notebook.md with:
-- Grouped sections (Definitions, Architecture, Case Studies, Tools, Open Questions)
-- Contradictions section
-- Cross references
+- a source catalog
+- per-source evidence blocks that preserve detail
+- contradictions and tensions across sources
+- unresolved questions
+- cross references
 
+Do not compress the notebook into a short summary. Preserve enough detail that later report stages can draft deep sections from this notebook alone.
