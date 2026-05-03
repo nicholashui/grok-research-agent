@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,9 +15,68 @@ from bs4 import BeautifulSoup
 from readability import Document
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-from grok_research_agent.grok_client import GrokClient, GrokError
+from grok_research_agent.grok_client import GrokClient, GrokError, GrokQuotaError, GrokTimeoutError
 from grok_research_agent.session_manager import SessionManager, SessionState
+
+
+class _TracingClient:
+    def __init__(self, inner: GrokClient, console: Console, *, max_chars: int):
+        self._inner = inner
+        self._console = console
+        self._max_chars = max(200, max_chars)
+        self._call_idx = 0
+
+    def prompt_from_file(self, prompt_path: Path) -> str:
+        return self._inner.prompt_from_file(prompt_path)
+
+    def render_template(self, template: str, values: dict[str, object]) -> str:
+        return self._inner.render_template(template, values)  # type: ignore[arg-type]
+
+    def _truncate(self, text: str) -> str:
+        # Strip control characters so raw fetched content can't break console rendering.
+        t = text.replace("\r\n", "\n")
+        t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "?", t)
+        if len(t) <= self._max_chars:
+            return t
+        head = t[: self._max_chars].rstrip()
+        return head + "\n…(truncated)…"
+
+    def _print_plain(self, text: str) -> None:
+        self._console.print(Text(text), markup=False, highlight=False, soft_wrap=True)
+
+    def chat_text(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_retries: int = 5,
+        temperature: float = 0.2,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        self._call_idx += 1
+        model = getattr(getattr(self._inner, "config", None), "model", "unknown")
+        default_max_tokens = getattr(getattr(self._inner, "config", None), "max_output_tokens", "unknown")
+        max_tokens = max_output_tokens if max_output_tokens is not None else default_max_tokens
+        self._console.print(
+            f"[cyan]LLM[{self._call_idx}] request[/cyan] model={model} temp={temperature} max_tokens={max_tokens}"
+        )
+        self._console.print("[cyan]system[/cyan]")
+        self._print_plain(self._truncate(system))
+        self._console.print("[cyan]user[/cyan]")
+        self._print_plain(self._truncate(user))
+
+        resp = self._inner.chat_text(
+            system=system,
+            user=user,
+            max_retries=max_retries,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        self._console.print(f"[green]LLM[{self._call_idx}] response[/green] chars={len(resp)}")
+        self._print_plain(self._truncate(resp))
+        return resp
 
 
 @dataclass(frozen=True)
@@ -41,6 +101,7 @@ class WorkflowRunner:
     SOURCE_CHUNK_CHARS = 45000
     SOURCE_CHUNK_OVERLAP = 5000
     NOTEBOOK_CHUNK_CHARS = 70000
+    FETCH_WORKERS = 4
     REPORT_SECTIONS: tuple[str, ...] = (
         "Core Definitions and Scope",
         "Architecture and Technical Mechanisms",
@@ -57,11 +118,15 @@ class WorkflowRunner:
         *,
         client_factory: Callable[[WorkflowContext], GrokClient] | None = None,
         http_get: Callable[..., requests.Response] | None = None,
+        trace_llm: bool = False,
+        trace_llm_max_chars: int = 2000,
     ):
         self.session_manager = session_manager
         self.console = console
         self._client_factory = client_factory
         self._http_get = http_get or requests.get
+        self._trace_llm = trace_llm
+        self._trace_llm_max_chars = max(200, trace_llm_max_chars)
 
     def run(self, session_id: str, command: str | None = None, **options: object) -> None:
         state = self.session_manager.load_state(session_id)
@@ -78,6 +143,10 @@ class WorkflowRunner:
 
         if command in {"generate-images"}:
             self._generate_images(ctx)
+            return
+
+        if command in {"youtube-script"}:
+            self._generate_youtube_script_from_final(ctx)
             return
 
         if command in {"synthesize"}:
@@ -111,6 +180,14 @@ class WorkflowRunner:
 
         if command == "show":
             self._show(ctx)
+            return
+
+        auto = bool(options.get("auto"))
+        if auto:
+            auto_full_collection = str(options.get("auto_full_collection") or "all").strip().lower()
+            if auto_full_collection not in {"all", "none"}:
+                auto_full_collection = "all"
+            self._run_unattended(ctx, auto_full_collection=auto_full_collection)
             return
 
         self._run_until_human_step(ctx)
@@ -157,17 +234,94 @@ class WorkflowRunner:
 
         self.console.print("Session is complete.")
 
+    def _run_unattended(self, ctx: WorkflowContext, *, auto_full_collection: str) -> None:
+        while True:
+            phase = ctx.state.current_phase
+
+            if phase >= 8:
+                self.console.print("Session is complete.")
+                return
+
+            if phase == 0:
+                self._phase0_scope(ctx, auto_confirm=True)
+                continue
+            if phase == 1:
+                self._phase1_discovery(ctx)
+                ctx.state.current_phase = 2
+                self.session_manager.save_state(ctx.state)
+                continue
+            if phase == 2:
+                self._phase2_curation(ctx, selection="all", auto_approve=True)
+                continue
+            if phase == 3:
+                self._phase3_extraction(ctx)
+                ctx.state.current_phase = 4
+                self.session_manager.save_state(ctx.state)
+                continue
+            if phase == 4:
+                self._phase4_notebook(ctx)
+                ctx.state.current_phase = 5
+                self.session_manager.save_state(ctx.state)
+                continue
+            if phase == 5:
+                self._phase5_synthesis(ctx, auto_feedback="approve")
+                continue
+            if phase == 6:
+                self._phase6_full_collection(ctx, selection=auto_full_collection)
+                continue
+            if phase == 7:
+                self._phase7_final_polish(ctx)
+                ctx.state.current_phase = 8
+                self.session_manager.save_state(ctx.state)
+                self.console.print(f"Final report ready at {ctx.session_dir / 'FINAL_REPORT.md'}")
+                continue
+
     def _client(self, ctx: WorkflowContext) -> GrokClient:
         if self._client_factory is not None:
-            return self._client_factory(ctx)
+            client = self._client_factory(ctx)
+            return _TracingClient(client, self.console, max_chars=self._trace_llm_max_chars) if self._trace_llm else client
         env_path = ctx.session_dir.parent.parent / ".env"
         if not env_path.exists():
             env_path = None
-        return GrokClient(env_path=env_path)
+        client = GrokClient(env_path=env_path)
+        return _TracingClient(client, self.console, max_chars=self._trace_llm_max_chars) if self._trace_llm else client
 
     def _write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    def _llm_optional(self, fn: Callable[[], str], *, context: str) -> str | None:
+        try:
+            return fn()
+        except GrokTimeoutError as e:
+            self.console.print(f"[yellow]{context} timed out after 5 minutes. Skipping and continuing.[/yellow]")
+            self.console.print(f"[dim]{e}[/dim]")
+            return None
+        except GrokQuotaError:
+            raise
+
+    def _prefetch_source_bundles(self, sources: list[dict[str, object]]) -> dict[int, dict[str, str]]:
+        jobs: dict[int, tuple[str, str]] = {}
+        for i, src in enumerate(sources, start=1):
+            url = str(src.get("url", "")).strip()
+            title = str(src.get("title", f"source-{i}")).strip()
+            if url:
+                jobs[i] = (url, title)
+
+        results: dict[int, dict[str, str]] = {}
+        if not jobs:
+            return results
+
+        max_workers = min(self.FETCH_WORKERS, len(jobs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._fetch_source_bundle, url): (idx, url, title) for idx, (url, title) in jobs.items()}
+            for future in as_completed(futures):
+                idx, url, title = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:  # noqa: BLE001
+                    self.console.print(f"[yellow]Fetch failed:[/yellow] {url} ({title}) ({e})")
+        return results
 
     def _strip_code_fences(self, text: str) -> str:
         t = text.strip()
@@ -186,6 +340,111 @@ class WorkflowRunner:
             return {"data": obj}
         except Exception:  # noqa: BLE001
             return {"raw": cleaned}
+
+    def _parse_json_relaxed(self, raw_text: str) -> object:
+        cleaned = self._strip_code_fences(raw_text)
+        for candidate in (raw_text, cleaned):
+            try:
+                return json.loads(candidate)
+            except Exception:  # noqa: BLE001
+                pass
+
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except Exception:  # noqa: BLE001
+                pass
+
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(cleaned[start : end + 1])
+            except Exception:  # noqa: BLE001
+                pass
+
+        return self._safe_json(raw_text)
+
+    def _canonicalize_curated_sources(self, raw_text: str) -> list[dict[str, object]]:
+        def normalize(src: dict[str, object], idx: int) -> dict[str, object] | None:
+            url = src.get("url") or src.get("URL") or src.get("link")
+            title = src.get("title") or src.get("Title") or src.get("name")
+            if url is None:
+                return None
+            url_s = str(url).strip()
+            if not url_s:
+                return None
+            return {
+                "title": str(title).strip() if title is not None else f"Source {idx}",
+                "url": url_s,
+                "type": str(src.get("type", "unknown")).strip() if src.get("type") is not None else "unknown",
+                "why_relevant": str(src.get("why_relevant", "")).strip() if src.get("why_relevant") is not None else "",
+                "credibility": src.get("credibility", ""),
+                "priority": str(src.get("priority", "")).strip() if src.get("priority") is not None else "",
+            }
+
+        obj = self._parse_json_relaxed(raw_text)
+        raw_items: list[object] | None = None
+        if isinstance(obj, list):
+            raw_items = obj
+        elif isinstance(obj, dict):
+            for key in ("sources", "curated_sources", "items", "data"):
+                val = obj.get(key)
+                if isinstance(val, list):
+                    raw_items = val
+                    break
+
+        if raw_items is None:
+            return []
+
+        out: list[dict[str, object]] = []
+        for idx, item in enumerate(raw_items, start=1):
+            if isinstance(item, str):
+                url = item.strip()
+                if url:
+                    out.append(
+                        {
+                            "title": f"Source {idx}",
+                            "url": url,
+                            "type": "unknown",
+                            "why_relevant": "",
+                            "credibility": "",
+                            "priority": "",
+                        }
+                    )
+                continue
+            if isinstance(item, dict):
+                norm = normalize(item, idx)
+                if norm is not None:
+                    out.append(norm)
+        return out
+
+    def _recover_curated_sources_from_discovery(self, discovery_md: str, *, limit: int = 50) -> list[dict[str, object]]:
+        urls: list[str] = []
+        seen: set[str] = set()
+        for raw in discovery_md.splitlines():
+            for m in re.finditer(r"https?://[^\s|)]+", raw):
+                url = m.group(0).strip()
+                if url and url not in seen:
+                    seen.add(url)
+                    urls.append(url)
+                if len(urls) >= limit:
+                    break
+            if len(urls) >= limit:
+                break
+        return [
+            {
+                "title": f"Source {i}",
+                "url": url,
+                "type": "unknown",
+                "why_relevant": "",
+                "credibility": "",
+                "priority": "",
+            }
+            for i, url in enumerate(urls, start=1)
+        ]
 
     def _slug(self, text: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -218,9 +477,23 @@ class WorkflowRunner:
             sections.append("## Full Page Text\n" + full_text.strip())
         return "\n\n".join(sections).strip()
 
-    def _fetch_source_bundle(self, url: str, timeout_s: int = 20) -> dict[str, str]:
-        resp = self._http_get(url, timeout=timeout_s, headers={"User-Agent": "grok-research-agent/0.1"})
-        resp.raise_for_status()
+    def _fetch_source_bundle(self, url: str, timeout_s: int = 10) -> dict[str, str]:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"Invalid URL: {url}")
+
+        connect_timeout_s = min(3, max(1, timeout_s))
+        read_timeout_s = max(1, timeout_s - connect_timeout_s)
+        try:
+            resp = self._http_get(
+                url,
+                timeout=(connect_timeout_s, read_timeout_s),
+                headers={"User-Agent": "grok-research-agent/0.1"},
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(f"Timed out after ~{timeout_s}s: {url}") from e
         content_type = resp.headers.get("content-type", "")
         raw = resp.text
         if "text/html" not in content_type:
@@ -249,7 +522,7 @@ class WorkflowRunner:
             "analysis_text": analysis_text,
         }
 
-    def _fetch_readable_text(self, url: str, timeout_s: int = 20) -> str:
+    def _fetch_readable_text(self, url: str, timeout_s: int = 10) -> str:
         return self._fetch_source_bundle(url, timeout_s=timeout_s)["analysis_text"]
 
     def _split_text_into_chunks(self, text: str, *, max_chars: int, overlap_chars: int) -> list[str]:
@@ -284,12 +557,16 @@ class WorkflowRunner:
         if not curated_path.exists():
             return []
         try:
-            sources = self.session_manager.read_json(curated_path)
+            raw = curated_path.read_text(encoding="utf-8")
         except Exception:  # noqa: BLE001
             return []
-        if not isinstance(sources, list):
-            return []
-        return [src for src in sources if isinstance(src, dict)]
+        sources = self._canonicalize_curated_sources(raw)
+        if sources:
+            try:
+                self.session_manager.write_json(curated_path, sources)
+            except Exception:  # noqa: BLE001
+                pass
+        return sources
 
     def _source_catalog_markdown(self, sources: list[dict[str, object]]) -> str:
         lines = [
@@ -350,6 +627,241 @@ class WorkflowRunner:
             anchor = re.sub(r"[^a-z0-9 -]", "", heading.lower()).replace(" ", "-")
             entries.append(f"- [{heading}](#{anchor})")
         return "## Table of Contents\n" + ("\n".join(entries) if entries else "- No sections found")
+
+    def _split_report_sections(self, report_md: str) -> list[tuple[str, str]]:
+        sections: list[tuple[str, str]] = []
+        current_title: str | None = None
+        current_lines: list[str] = []
+        for line in report_md.splitlines():
+            if line.startswith("## "):
+                if current_title is not None:
+                    sections.append((current_title, "\n".join(current_lines).strip()))
+                current_title = line[3:].strip()
+                current_lines = []
+                continue
+            if current_title is None:
+                continue
+            current_lines.append(line)
+        if current_title is not None:
+            sections.append((current_title, "\n".join(current_lines).strip()))
+        return sections
+
+    def _clean_for_narration(self, text: str) -> str:
+        t = re.sub(r"\[\d+\]", "", text)
+        lines: list[str] = []
+        for raw in t.splitlines():
+            line = raw.strip()
+            if not line:
+                lines.append("")
+                continue
+            if "http://" in line.lower() or "https://" in line.lower():
+                continue
+            lines.append(raw)
+        return "\n".join(lines).strip()
+
+    def _word_count(self, text: str) -> int:
+        return len([w for w in re.split(r"\s+", text.strip()) if w])
+
+    def _youtube_source_sections(self, ctx: WorkflowContext, final_report_md: str) -> list[tuple[str, str]]:
+        ignore_titles = {
+            "Table of Contents",
+            "Source Catalog",
+            "Glossary",
+            "References",
+            "Knowledge Base Overview",
+            "Executive Summary",
+        }
+
+        drafts_dir = ctx.session_dir / "05_section_drafts"
+        if drafts_dir.exists():
+            draft_texts: dict[str, str] = {}
+            for p in sorted(drafts_dir.glob("*.md")):
+                try:
+                    raw = p.read_text(encoding="utf-8").strip()
+                except OSError:
+                    continue
+                if not raw:
+                    continue
+                title = None
+                for line in raw.splitlines():
+                    if line.startswith("## "):
+                        title = line[3:].strip()
+                        break
+                if title is None:
+                    title = p.stem.replace("-", " ").strip().title() or p.stem
+                if title in ignore_titles:
+                    continue
+                draft_texts[title] = raw
+
+            ordered: list[tuple[str, str]] = []
+            for expected in self.REPORT_SECTIONS:
+                if expected in draft_texts:
+                    ordered.append((expected, self._clean_for_narration(draft_texts[expected])))
+            for title, raw in draft_texts.items():
+                if title not in {t for t, _ in ordered}:
+                    ordered.append((title, self._clean_for_narration(raw)))
+            if ordered:
+                return ordered
+
+        def normalize_headings(text: str) -> str:
+            lines_out: list[str] = []
+            for ln in text.splitlines():
+                m = re.match(r"^\s*\*{0,2}\s*(#{2,6})\s*(.*?)\s*\*{0,2}\s*$", ln)
+                if m:
+                    hashes = m.group(1)
+                    title = m.group(2).strip()
+                    lines_out.append(f"{hashes} {title}".rstrip())
+                else:
+                    lines_out.append(ln)
+            return "\n".join(lines_out)
+
+        normalized = normalize_headings(final_report_md)
+        raw_sections = self._split_report_sections(normalized)
+        return [
+            (title, self._clean_for_narration(body))
+            for title, body in raw_sections
+            if title not in ignore_titles and body.strip()
+        ]
+
+    def _expand_youtube_segment(
+        self,
+        client: GrokClient,
+        *,
+        segment_md: str,
+        min_words: int,
+        max_output_tokens: int,
+    ) -> str:
+        if self._word_count(segment_md) >= min_words:
+            return segment_md
+        expand_prompt = "\n".join(
+            [
+                "You are expanding a YouTube narration script segment in Markdown.",
+                "Make it substantially more detailed and explanatory for spoken delivery.",
+                "Do not include URLs, citations, footnotes, references, or glossary content.",
+                "Add: clearer step-by-step explanations, concrete examples, and at least one analogy.",
+                "Keep existing headings and improve transitions. Add occasional [pause], [beat], [emphasis].",
+                f"Minimum length: {min_words} words.",
+                "",
+                "Segment to expand:",
+                segment_md.strip() or "(empty)",
+                "",
+                "Output ONLY the expanded segment in Markdown.",
+            ]
+        )
+        expanded = self._llm_optional(
+            lambda: client.chat_text(system="You are Grok.", user=expand_prompt, max_output_tokens=max_output_tokens).strip(),
+            context="YouTube script expansion",
+        )
+        return expanded if expanded is not None else segment_md
+
+    def _generate_youtube_script(self, ctx: WorkflowContext, *, final_report_md: str) -> None:
+        client = self._client(ctx)
+        base_max_tokens = getattr(getattr(client, "config", None), "max_output_tokens", 1200)
+
+        def tokens(*, floor: int, mult: int, ceiling: int = 50000) -> int:
+            try:
+                base = int(base_max_tokens)
+            except Exception:  # noqa: BLE001
+                base = 1200
+            return max(floor, min(ceiling, base * mult))
+
+        sections = self._youtube_source_sections(ctx, final_report_md)
+        titles = [t for t, _ in sections]
+
+        intro_prompt = "\n".join(
+            [
+                "You are writing a YouTube narration script in Markdown.",
+                "Make it conversational, clear, and engaging for spoken delivery.",
+                "Do not include URLs, citations, footnotes, or glossary sections.",
+                "Use natural transitions and include occasional spoken-direction cues like [pause], [beat], [emphasis].",
+                "Be meaningfully longer than the source report: add explanations, context, examples, and intuitive analogies.",
+                "Start with these headings exactly: '# YouTube Script' then '## Introduction'.",
+                "Aim for ~300–600 words for the introduction.",
+                f"Topic: {ctx.state.topic}",
+                "Planned sections:",
+                "\n".join(f"- {t}" for t in titles) if titles else "- (none)",
+                "",
+                "Write a strong hook, a quick 'why you should care', and a short roadmap. Output Markdown only.",
+            ]
+        )
+        parts: list[str] = []
+        intro = self._llm_optional(
+            lambda: client.chat_text(system="You are Grok.", user=intro_prompt, max_output_tokens=tokens(floor=2400, mult=3)).strip(),
+            context="YouTube introduction",
+        ) or "# YouTube Script\n\n## Introduction\n[pause] The introduction step timed out, so this script starts directly with the main sections.\n"
+        intro = self._expand_youtube_segment(client, segment_md=intro, min_words=300, max_output_tokens=tokens(floor=3200, mult=4))
+        parts.append(intro)
+
+        for idx, (title, body) in enumerate(sections, start=1):
+            next_title = sections[idx][0] if idx < len(sections) else "Conclusion"
+            section_prompt = "\n".join(
+                [
+                    "Transform the section content into a YouTube narration script segment.",
+                    "Requirements:",
+                    "- Conversational, spoken-language phrasing with clear explanations.",
+                    "- Keep all key technical details, but explain jargon in simple terms on first use.",
+                    "- Add a mini-intro, then teach the topic step-by-step, then a mini-conclusion.",
+                    "- Add at least one concrete example scenario (what it looks like in practice).",
+                    "- Add at least one simple analogy or mental model to make it intuitive.",
+                    "- Add smooth transition leading into the next section.",
+                    "- Do not include URLs, citations, or reference lists.",
+                    "- Use occasional cues like [pause], [beat], [emphasis].",
+                    "- Aim for ~800–1400 words for this section unless the source is truly empty.",
+                    "",
+                    f"Section title: {title}",
+                    f"Next section: {next_title}",
+                    "",
+                    "Source section content:",
+                    body or "(empty)",
+                    "",
+                    "Output Markdown only, starting with a level-2 heading for the section.",
+                ]
+            )
+            segment = self._llm_optional(
+                lambda: client.chat_text(
+                    system="You are Grok.",
+                    user=section_prompt,
+                    max_output_tokens=tokens(floor=5000, mult=5),
+                ).strip(),
+                context=f"YouTube section {title}",
+            )
+            if segment is None:
+                continue
+            segment = self._expand_youtube_segment(client, segment_md=segment, min_words=800, max_output_tokens=tokens(floor=6500, mult=6))
+            parts.append(segment)
+
+        outro_prompt = "\n".join(
+            [
+                "Write a YouTube-style closing for this topic.",
+                "Requirements:",
+                "- Summarize the key takeaways in a friendly way.",
+                "- Include a short 'what to do next' checklist the viewer can actually follow.",
+                "- Include a final call-to-action (like subscribe) but keep it subtle.",
+                "- Do not include URLs, citations, or glossary.",
+                "- Use [pause] or [beat] cues sparingly.",
+                "",
+                f"Topic: {ctx.state.topic}",
+                "Output Markdown only with a level-2 heading 'Conclusion'.",
+            ]
+        )
+        outro = self._llm_optional(
+            lambda: client.chat_text(system="You are Grok.", user=outro_prompt, max_output_tokens=tokens(floor=2200, mult=3)).strip(),
+            context="YouTube conclusion",
+        ) or "## Conclusion\n[beat] The conclusion step timed out, so use the earlier sections as the main teaching content.\n"
+        outro = self._expand_youtube_segment(client, segment_md=outro, min_words=220, max_output_tokens=tokens(floor=3200, mult=4))
+        parts.append(outro)
+
+        script_md = "\n\n".join(p for p in parts if p.strip()).strip() + "\n"
+        self._write(ctx.run_dir / "Youtube_Script.md", script_md)
+        self._write(ctx.session_dir / "Youtube_Script.md", script_md)
+
+    def _generate_youtube_script_from_final(self, ctx: WorkflowContext) -> None:
+        report = ctx.session_dir / "FINAL_REPORT.md"
+        if not report.exists():
+            self.console.print("Missing FINAL_REPORT.md")
+            return
+        self._generate_youtube_script(ctx, final_report_md=report.read_text(encoding="utf-8"))
+        self.console.print(f"Saved {ctx.session_dir / 'Youtube_Script.md'}")
 
     def _compiler_source(self, ctx: WorkflowContext) -> str | None:
         notebook = ctx.session_dir / "04_master_notebook.md"
@@ -509,7 +1021,7 @@ class WorkflowRunner:
                             lines.append(f"  {a} --> {b}")
         return "\n".join(lines) + "\n"
 
-    def _phase0_scope(self, ctx: WorkflowContext) -> None:
+    def _phase0_scope(self, ctx: WorkflowContext, *, auto_confirm: bool = False) -> None:
         try:
             client = self._client(ctx)
         except GrokError as e:
@@ -527,6 +1039,11 @@ class WorkflowRunner:
         self._write(scope_path, scope_md)
 
         self.console.print(scope_md)
+        if auto_confirm:
+            self._write(ctx.session_dir / "00_scope_confirmed.md", scope_md)
+            ctx.state.current_phase = 1
+            self.session_manager.save_state(ctx.state)
+            return
         while True:
             ans = input("Do you confirm this scope? (yes/edit/cancel) ").strip().lower()
             if ans == "cancel":
@@ -564,7 +1081,7 @@ class WorkflowRunner:
         self._write(ctx.session_dir / "01_discovery_table.md", discovery_md)
         self.console.print("Saved discovery table.")
 
-    def _phase2_curation(self, ctx: WorkflowContext) -> None:
+    def _phase2_curation(self, ctx: WorkflowContext, *, selection: str | None = None, auto_approve: bool = False) -> None:
         client = self._client(ctx)
         discovery_path = ctx.session_dir / "01_discovery_table.md"
         if not discovery_path.exists():
@@ -582,27 +1099,48 @@ class WorkflowRunner:
         self.console.print(
             "Enter numbers to KEEP (comma separated), or 'all', or 'add <url1> <url2>', or 'remove 2,5'. Type 'gap' first to let Grok suggest missing topics."
         )
-        selection = input().strip()
+        selection = (selection if selection is not None else input().strip()).strip()
         template = client.prompt_from_file(ctx.prompts_dir / "curation_prompt.txt")
-        user_prompt = client.render_template(
-            template,
-            {"discovery_table": discovery_md, "selection": selection, "topic": ctx.state.topic},
-        )
-        curated_json = client.chat_text(system="You are Grok.", user=user_prompt)
+        curated_json = ""
+        curated_sources: list[dict[str, object]] = []
+        for attempt in range(3):
+            if attempt == 0:
+                selection_for_attempt = selection
+            else:
+                selection_for_attempt = (
+                    f"{selection}\n\nIMPORTANT: Output JSON only, no code fences, no commentary. "
+                    "If the list would be long, return the TOP 20 highest-priority sources only."
+                )
+            user_prompt = client.render_template(
+                template,
+                {"discovery_table": discovery_md, "selection": selection_for_attempt, "topic": ctx.state.topic},
+            )
+            curated_json = client.chat_text(system="You are Grok.", user=user_prompt)
+            curated_sources = self._canonicalize_curated_sources(curated_json)
+            if curated_sources:
+                break
+
+        if not curated_sources:
+            curated_sources = self._recover_curated_sources_from_discovery(discovery_md)
+            curated_json = json.dumps(curated_sources, indent=2, ensure_ascii=False)
         curated_path = ctx.run_dir / "02_curated_sources.json"
         self._write(curated_path, curated_json)
-        self._write(ctx.session_dir / "02_curated_sources.json", curated_json)
+        self.session_manager.write_json(ctx.session_dir / "02_curated_sources.json", curated_sources)
 
         gap_template = client.prompt_from_file(ctx.prompts_dir / "gap_prompt.txt")
+        curated_for_gap = json.dumps(curated_sources, indent=2, ensure_ascii=False)
         gap_prompt = client.render_template(
             gap_template,
-            {"curated_sources_json": curated_json, "topic": ctx.state.topic},
+            {"curated_sources_json": curated_for_gap, "topic": ctx.state.topic},
         )
-        gap_report = client.chat_text(system="You are Grok.", user=gap_prompt)
+        gap_report = self._llm_optional(
+            lambda: client.chat_text(system="You are Grok.", user=gap_prompt),
+            context="Gap analysis",
+        ) or "# Gaps\nSkipped because the LLM call timed out."
         self._write(ctx.run_dir / "02_gap_report.md", gap_report)
         self.console.print(gap_report)
 
-        ans = input("Type 'approve' to continue: ").strip().lower()
+        ans = "approve" if auto_approve else input("Type 'approve' to continue: ").strip().lower()
         if ans != "approve":
             self.console.print("Not approved. Resume again to repeat curation.")
             return
@@ -619,6 +1157,14 @@ class WorkflowRunner:
             return
 
         curated_raw = curated_path.read_text(encoding="utf-8")
+        sources = self._canonicalize_curated_sources(curated_raw)
+        if not sources:
+            self.console.print("Curated sources file is invalid or empty. Resume from Phase 2 to re-curate sources.")
+            return
+        try:
+            self.session_manager.write_json(curated_path, sources)
+        except Exception:  # noqa: BLE001
+            pass
         template = client.prompt_from_file(ctx.prompts_dir / "extraction_prompt.txt")
 
         extracted_dir = ctx.run_dir / "03_extracted"
@@ -634,23 +1180,19 @@ class WorkflowRunner:
         session_chunk_dir = ctx.session_dir / "03_extracted_chunks"
         session_chunk_dir.mkdir(parents=True, exist_ok=True)
 
-        extraction_plan = client.chat_text(
-            system="You are Grok.",
-            user=client.render_template(
-                client.prompt_from_file(ctx.prompts_dir / "extraction_plan_prompt.txt"),
-                {"curated_sources_json": curated_raw, "topic": ctx.state.topic},
+        extraction_plan = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=client.render_template(
+                    client.prompt_from_file(ctx.prompts_dir / "extraction_plan_prompt.txt"),
+                    {"curated_sources_json": curated_raw, "topic": ctx.state.topic},
+                ),
             ),
-        )
+            context="Extraction plan",
+        ) or "# Extraction Plan\nSkipped because the LLM call timed out."
         self._write(ctx.run_dir / "03_extraction_plan.md", extraction_plan)
 
-        sources = []
-        try:
-            sources = self.session_manager.read_json(curated_path)
-        except Exception:
-            pass
-        if not isinstance(sources, list):
-            self.console.print("Curated sources JSON is not a list. Fix it and resume.")
-            return
+        prefetched_bundles = self._prefetch_source_bundles(sources)
 
         for i, src in enumerate(sources, start=1):
             url = str(src.get("url", "")).strip()
@@ -658,10 +1200,8 @@ class WorkflowRunner:
             if not url:
                 continue
             self.console.print(f"Extracting {i}/{len(sources)}: {title}")
-            try:
-                bundle = self._fetch_source_bundle(url)
-            except Exception as e:  # noqa: BLE001
-                self.console.print(f"[yellow]Fetch failed:[/yellow] {url} ({e})")
+            bundle = prefetched_bundles.get(i)
+            if bundle is None:
                 continue
 
             base_name = f"{i:03d}_{self._slug(title)[:50]}"
@@ -711,11 +1251,20 @@ class WorkflowRunner:
                         "content": chunk,
                     },
                 )
-                extracted_chunk = client.chat_text(system="You are Grok.", user=user_prompt)
+                extracted_chunk = self._llm_optional(
+                    lambda: client.chat_text(system="You are Grok.", user=user_prompt),
+                    context=f"Extraction chunk {chunk_idx}/{len(chunks)} for source {i}",
+                )
+                if extracted_chunk is None:
+                    continue
                 chunk_path = run_chunk_dir / f"{base_name}_chunk_{chunk_idx:02d}.md"
                 self._write(chunk_path, extracted_chunk)
                 self._write(session_chunk_dir / f"{base_name}_chunk_{chunk_idx:02d}.md", extracted_chunk)
                 chunk_sections.append(f"## Chunk {chunk_idx} of {len(chunks)}\n\n{extracted_chunk.strip()}")
+
+            if not chunk_sections:
+                self.console.print(f"[yellow]No extraction chunks completed for source {i}. Skipping source dossier.[/yellow]")
+                continue
 
             extracted_md = "\n\n".join(
                 [
@@ -764,7 +1313,7 @@ class WorkflowRunner:
         self._write(ctx.run_dir / "04_master_notebook.md", notebook)
         self._write(ctx.session_dir / "04_master_notebook.md", notebook)
 
-    def _phase5_synthesis(self, ctx: WorkflowContext, force: bool = False) -> None:
+    def _phase5_synthesis(self, ctx: WorkflowContext, force: bool = False, *, auto_feedback: str | None = None) -> None:
         client = self._client(ctx)
         notebook_path = ctx.session_dir / "04_master_notebook.md"
         if not notebook_path.exists():
@@ -810,11 +1359,20 @@ class WorkflowRunner:
                         "notebook_chunk": chunk,
                     },
                 )
-                evidence_md = client.chat_text(system="You are Grok.", user=evidence_prompt)
+                evidence_md = self._llm_optional(
+                    lambda: client.chat_text(system="You are Grok.", user=evidence_prompt),
+                    context=f"Evidence packet {chunk_idx}/{len(notebook_chunks)} for section {section_name}",
+                )
+                if evidence_md is None:
+                    continue
                 evidence_packets.append(f"### Evidence Packet {chunk_idx}\n\n{evidence_md.strip()}")
                 packet_name = f"{section_slug}_chunk_{chunk_idx:02d}.md"
                 self._write(section_evidence_dir / packet_name, evidence_md)
                 self._write(session_evidence_dir / packet_name, evidence_md)
+
+            if not evidence_packets:
+                self.console.print(f"[yellow]No evidence packets completed for section '{section_name}'. Skipping section.[/yellow]")
+                continue
 
             section_prompt = client.render_template(
                 section_template,
@@ -826,7 +1384,12 @@ class WorkflowRunner:
                     "section_evidence": "\n\n".join(evidence_packets),
                 },
             )
-            section_md = client.chat_text(system="You are Grok.", user=section_prompt).strip()
+            section_md = self._llm_optional(
+                lambda: client.chat_text(system="You are Grok.", user=section_prompt).strip(),
+                context=f"Draft section {section_name}",
+            )
+            if section_md is None:
+                continue
             drafted_sections.append(section_md)
             section_name_path = f"{section_slug}.md"
             self._write(section_draft_dir / section_name_path, section_md)
@@ -853,7 +1416,7 @@ class WorkflowRunner:
         self.console.print(
             "Reply with: approve | revise <section> <feedback> | add-section \"Title\" | gap-check"
         )
-        feedback = input().strip()
+        feedback = (auto_feedback if auto_feedback is not None else input().strip()).strip()
         if feedback.lower() == "approve":
             ctx.state.current_phase = 6
             self.session_manager.save_state(ctx.state)
@@ -861,28 +1424,46 @@ class WorkflowRunner:
             return
 
         revise_template = client.prompt_from_file(ctx.prompts_dir / "revise_prompt.txt")
-        revised = client.chat_text(
-            system="You are Grok.",
-            user=client.render_template(
-                revise_template,
-                {
-                    "draft": draft,
-                    "feedback": feedback,
-                    "topic": ctx.state.topic,
-                },
+        revised = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=client.render_template(
+                    revise_template,
+                    {
+                        "draft": draft,
+                        "feedback": feedback,
+                        "topic": ctx.state.topic,
+                    },
+                ),
             ),
+            context="Draft revision",
         )
+        if revised is None:
+            self.console.print("[yellow]Revision timed out. Keeping the previous draft.[/yellow]")
+            return
         v2 = v + 1
         draft_name2 = f"05_draft_v{v2}.md"
         self._write(ctx.run_dir / draft_name2, revised)
         self._write(ctx.session_dir / draft_name2, revised)
         self.console.print(f"Saved {draft_name2}. Resume to review again (H2).")
 
-    def _phase6_full_collection(self, ctx: WorkflowContext) -> None:
+    def _phase6_full_collection(self, ctx: WorkflowContext, *, selection: str | None = None) -> None:
         sources = self._load_curated_sources(ctx)
         if not sources:
-            self.console.print("Missing curated sources.")
-            return
+            discovery_path = ctx.session_dir / "01_discovery_table.md"
+            if discovery_path.exists():
+                recovered = self._recover_curated_sources_from_discovery(discovery_path.read_text(encoding="utf-8"))
+                if recovered:
+                    sources = recovered
+                    try:
+                        self.session_manager.write_json(ctx.session_dir / "02_curated_sources.json", sources)
+                    except Exception:  # noqa: BLE001
+                        pass
+            if not sources:
+                ctx.state.current_phase = 7
+                self.session_manager.save_state(ctx.state)
+                self.console.print("Missing curated sources. Skipping full collection. Resume to finalize.")
+                return
 
         table = Table(title="Select sources for full offline Markdown copies")
         table.add_column("#")
@@ -891,7 +1472,9 @@ class WorkflowRunner:
         for i, src in enumerate(sources, start=1):
             table.add_row(str(i), str(src.get("title", ""))[:60], str(src.get("url", ""))[:80])
         self.console.print(table)
-        ans = input("Which sources do you want FULL offline Markdown copies of? (numbers or 'all' or 'none') ").strip().lower()
+        ans = (selection if selection is not None else input(
+            "Which sources do you want FULL offline Markdown copies of? (numbers or 'all' or 'none') "
+        )).strip().lower()
         if ans == "none":
             ctx.state.current_phase = 7
             self.session_manager.save_state(ctx.state)
@@ -915,15 +1498,21 @@ class WorkflowRunner:
         full_dir.mkdir(parents=True, exist_ok=True)
         session_full_dir = ctx.session_dir / "06_full_sources"
         session_full_dir.mkdir(parents=True, exist_ok=True)
+        selected_sources = [sources[i - 1] for i in sorted(picks) if 1 <= i <= len(sources)]
+        prefetched_selected = self._prefetch_source_bundles(selected_sources)
+        prefetched_bundles = {
+            original_idx: prefetched_selected.get(local_idx)
+            for local_idx, original_idx in enumerate(sorted(picks), start=1)
+            if prefetched_selected.get(local_idx) is not None
+        }
         for i in sorted(picks):
             if i < 1 or i > len(sources):
                 continue
             url = str(sources[i - 1].get("url", ""))
             if not url:
                 continue
-            try:
-                bundle = self._fetch_source_bundle(url)
-            except Exception:
+            bundle = prefetched_bundles.get(i)
+            if bundle is None:
                 continue
             content = "\n\n".join(
                 [
@@ -955,30 +1544,36 @@ class WorkflowRunner:
         source_catalog = self._source_catalog_markdown(sources) if sources else "No curated sources available."
         knowledge_outline = self._knowledge_outline_markdown(ctx) or "No knowledge-base artifacts available yet."
         final_template = client.prompt_from_file(ctx.prompts_dir / "final_polish_prompt.txt")
-        executive_summary = client.chat_text(
-            system="You are Grok.",
-            user=client.render_template(
-                final_template,
-                {
-                    "topic": ctx.state.topic,
-                    "report_body": latest_draft,
-                    "source_catalog": source_catalog,
-                    "knowledge_outline": knowledge_outline,
-                },
-            ),
-        ).strip()
+        executive_summary = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=client.render_template(
+                    final_template,
+                    {
+                        "topic": ctx.state.topic,
+                        "report_body": latest_draft,
+                        "source_catalog": source_catalog,
+                        "knowledge_outline": knowledge_outline,
+                    },
+                ),
+            ).strip(),
+            context="Executive summary generation",
+        ) or "Summary generation timed out. The detailed draft sections below still contain the main findings."
         glossary_template = client.prompt_from_file(ctx.prompts_dir / "glossary_prompt.txt")
-        glossary = client.chat_text(
-            system="You are Grok.",
-            user=client.render_template(
-                glossary_template,
-                {
-                    "topic": ctx.state.topic,
-                    "report_body": latest_draft,
-                    "knowledge_outline": knowledge_outline,
-                },
-            ),
-        ).strip()
+        glossary = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=client.render_template(
+                    glossary_template,
+                    {
+                        "topic": ctx.state.topic,
+                        "report_body": latest_draft,
+                        "knowledge_outline": knowledge_outline,
+                    },
+                ),
+            ).strip(),
+            context="Glossary generation",
+        ) or "- Glossary generation timed out."
         draft_body = latest_draft
         if draft_body.startswith("# "):
             draft_body = "\n".join(draft_body.splitlines()[1:]).strip()
@@ -999,12 +1594,18 @@ class WorkflowRunner:
         self._write(ctx.session_dir / "FINAL_REPORT.md", final_md)
 
         image_template = client.prompt_from_file(ctx.prompts_dir / "images_prompt.txt")
-        image_prompts = client.chat_text(
-            system="You are Grok.",
-            user=client.render_template(image_template, {"report": final_md}),
+        image_prompts = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=client.render_template(image_template, {"report": final_md}),
+            ),
+            context="Image prompt generation",
         )
-        self._write(ctx.run_dir / "images_to_generate.md", image_prompts)
-        self._write(ctx.session_dir / "images_to_generate.md", image_prompts)
+        if image_prompts is not None:
+            self._write(ctx.run_dir / "images_to_generate.md", image_prompts)
+            self._write(ctx.session_dir / "images_to_generate.md", image_prompts)
+
+        self._generate_youtube_script(ctx, final_report_md=final_md)
 
     def _generate_images(self, ctx: WorkflowContext) -> None:
         report = ctx.session_dir / "FINAL_REPORT.md"
@@ -1013,10 +1614,15 @@ class WorkflowRunner:
             return
         client = self._client(ctx)
         image_template = client.prompt_from_file(ctx.prompts_dir / "images_prompt.txt")
-        image_prompts = client.chat_text(
-            system="You are Grok.",
-            user=client.render_template(image_template, {"report": report.read_text(encoding="utf-8")}),
+        image_prompts = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=client.render_template(image_template, {"report": report.read_text(encoding="utf-8")}),
+            ),
+            context="Image prompt generation",
         )
+        if image_prompts is None:
+            return
         self._write(ctx.run_dir / "images_to_generate.md", image_prompts)
         self._write(ctx.session_dir / "images_to_generate.md", image_prompts)
         self.console.print(f"Saved {ctx.session_dir / 'images_to_generate.md'}")

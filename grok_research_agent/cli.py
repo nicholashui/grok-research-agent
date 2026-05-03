@@ -3,6 +3,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from grok_research_agent.grok_client import GrokError, GrokQuotaError
 from grok_research_agent.session_manager import SessionManager
 from grok_research_agent.workflow_phases import WorkflowRunner
 
@@ -15,6 +16,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--sessions-dir",
         default=str(Path.cwd() / "research_sessions"),
         help="Directory where sessions are stored",
+    )
+    common.add_argument(
+        "--auto",
+        action="store_true",
+        help="Auto-accept all human-in-the-loop prompts and run the workflow to completion",
+    )
+    common.add_argument(
+        "--auto-full-collection",
+        default="all",
+        choices=["all", "none"],
+        help="In --auto mode, whether to save full offline copies of sources (H3)",
+    )
+    common.add_argument(
+        "--trace-llm",
+        action="store_true",
+        help="Print LLM requests/responses to the console (truncated)",
+    )
+    common.add_argument(
+        "--trace-llm-max-chars",
+        type=int,
+        default=2000,
+        help="Max characters to print per request/response when --trace-llm is enabled",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -73,6 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     gen.add_argument("--session-id", required=True)
+
+    yt = sub.add_parser(
+        "youtube-script",
+        help="Generate a YouTube narration script from FINAL_REPORT.md",
+        parents=[common],
+    )
+    yt.add_argument("--session-id", required=True)
     return parser
 
 
@@ -80,6 +110,17 @@ def main(argv: list[str] | None = None) -> int:
     console = Console()
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    def run_with_error_handling(runner: WorkflowRunner, *runner_args: object, **runner_kwargs: object) -> int:
+        try:
+            runner.run(*runner_args, **runner_kwargs)
+            return 0
+        except GrokQuotaError as e:
+            console.print(f"[red]{e}[/red]")
+            return 1
+        except GrokError as e:
+            console.print(f"[red]{e}[/red]")
+            return 1
 
     if args.command == "list-types":
         console.print("auto-hypergraph")
@@ -100,35 +141,50 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "start":
         session = manager.create_session(topic=args.topic, focus=args.focus, mode=args.session_mode)
         console.print(f"Session created: [bold]{session.session_id}[/bold]")
-        runner = WorkflowRunner(session_manager=manager, console=console)
-        runner.run(session.session_id)
-        return 0
+        runner = WorkflowRunner(
+            session_manager=manager,
+            console=console,
+            trace_llm=args.trace_llm,
+            trace_llm_max_chars=args.trace_llm_max_chars,
+        )
+        return run_with_error_handling(
+            runner,
+            session.session_id,
+            auto=args.auto,
+            auto_full_collection=args.auto_full_collection,
+        )
 
-    if args.command in {"resume", "update", "synthesize", "generate-images"}:
+    if args.command in {"resume", "update", "synthesize", "generate-images", "youtube-script"}:
         session_id = args.session_id
-        runner = WorkflowRunner(session_manager=manager, console=console)
-        runner.run(session_id, command=args.command)
-        return 0
+        runner = WorkflowRunner(
+            session_manager=manager,
+            console=console,
+            trace_llm=args.trace_llm,
+            trace_llm_max_chars=args.trace_llm_max_chars,
+        )
+        return run_with_error_handling(
+            runner,
+            session_id,
+            command=args.command,
+            auto=args.auto,
+            auto_full_collection=args.auto_full_collection,
+        )
 
     if args.command == "compile":
         runner = WorkflowRunner(session_manager=manager, console=console)
-        runner.run(args.session_id, command="compile", compile_type=args.compile_type)
-        return 0
+        return run_with_error_handling(runner, args.session_id, command="compile", compile_type=args.compile_type)
 
     if args.command == "drill":
         runner = WorkflowRunner(session_manager=manager, console=console)
-        runner.run(args.session_id, command="drill", drill_mode=args.drill_mode)
-        return 0
+        return run_with_error_handling(runner, args.session_id, command="drill", drill_mode=args.drill_mode)
 
     if args.command == "feed":
         runner = WorkflowRunner(session_manager=manager, console=console)
-        runner.run(args.session_id, command="feed", new_doc=args.new_doc)
-        return 0
+        return run_with_error_handling(runner, args.session_id, command="feed", new_doc=args.new_doc)
 
     if args.command == "show":
         runner = WorkflowRunner(session_manager=manager, console=console)
-        runner.run(args.session_id, command="show")
-        return 0
+        return run_with_error_handling(runner, args.session_id, command="show")
 
     console.print(f"Unknown command: {args.command}")
     return 2

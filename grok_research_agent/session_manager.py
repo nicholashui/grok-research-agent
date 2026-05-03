@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -13,6 +14,15 @@ def _slugify(text: str) -> str:
     text = re.sub(r"[^a-z0-9]+", "-", text)
     text = re.sub(r"-+", "-", text).strip("-")
     return text or "session"
+
+
+def _topic_to_session_prefix(topic: str, *, max_len: int = 60) -> str:
+    slug = _slugify(topic)
+    if len(slug) <= max_len:
+        return slug
+    digest = hashlib.sha1(topic.encode("utf-8")).hexdigest()[:8]
+    trimmed = slug[:max_len].rstrip("-") or "session"
+    return f"{trimmed}-{digest}"
 
 
 class SessionState(BaseModel):
@@ -60,7 +70,7 @@ class SessionManager:
 
     def create_session(self, topic: str, focus: str | None, *, mode: str = "report") -> SessionState:
         date = datetime.now().strftime("%Y%m%d")
-        base = f"{_slugify(topic)}-{date}"
+        base = f"{_topic_to_session_prefix(topic)}-{date}"
         session_id = base
         idx = 2
         while (self.sessions_dir / session_id).exists():
