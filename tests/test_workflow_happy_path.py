@@ -44,6 +44,8 @@ class FakeGrokClient:
 
     def _auto_reply(self, user: str) -> str:
         lower = user.lower()
+        if "strict total word-count target" in lower:
+            return user.split("Document:\n", 1)[1] if "Document:\n" in user else "# Expanded\nContent"
         if "youtube" in lower:
             return (
                 "# YouTube Script\n\n"

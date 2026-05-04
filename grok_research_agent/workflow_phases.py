@@ -6,12 +6,14 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 from readability import Document
 from rich.console import Console
 from rich.table import Table
@@ -102,6 +104,11 @@ class WorkflowRunner:
     SOURCE_CHUNK_OVERLAP = 5000
     NOTEBOOK_CHUNK_CHARS = 70000
     FETCH_WORKERS = 4
+    EXTRACTION_WORKERS = 2
+    EVIDENCE_WORKERS = 2
+    FINAL_REPORT_MIN_WORDS = 9000
+    FINAL_REPORT_MAX_WORDS = 10000
+    FINAL_REPORT_TARGET_WORDS = 9500
     REPORT_SECTIONS: tuple[str, ...] = (
         "Core Definitions and Scope",
         "Architecture and Technical Mechanisms",
@@ -290,6 +297,19 @@ class WorkflowRunner:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
+    def _normalize_url(self, url: str) -> str:
+        cleaned = url.strip().strip("`'\"")
+        while cleaned and cleaned[-1] in ").,]}>`'\"":
+            candidate = cleaned[:-1].rstrip()
+            if candidate.count("(") < candidate.count(")"):
+                cleaned = candidate
+                continue
+            if cleaned[-1] in ".,]}>`'\"":
+                cleaned = candidate
+                continue
+            break
+        return cleaned
+
     def _llm_optional(self, fn: Callable[[], str], *, context: str) -> str | None:
         try:
             return fn()
@@ -303,7 +323,7 @@ class WorkflowRunner:
     def _prefetch_source_bundles(self, sources: list[dict[str, object]]) -> dict[int, dict[str, str]]:
         jobs: dict[int, tuple[str, str]] = {}
         for i, src in enumerate(sources, start=1):
-            url = str(src.get("url", "")).strip()
+            url = self._normalize_url(str(src.get("url", "")))
             title = str(src.get("title", f"source-{i}")).strip()
             if url:
                 jobs[i] = (url, title)
@@ -321,6 +341,29 @@ class WorkflowRunner:
                     results[idx] = future.result()
                 except Exception as e:  # noqa: BLE001
                     self.console.print(f"[yellow]Fetch failed:[/yellow] {url} ({title}) ({e})")
+        return results
+
+    def _parallel_map_ordered(
+        self,
+        items: list[tuple[int, str]],
+        *,
+        max_workers: int,
+        fn: Callable[[int, str], str | None],
+    ) -> list[tuple[int, str]]:
+        if not items:
+            return []
+        results: list[tuple[int, str]] = []
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as executor:
+            futures = {executor.submit(fn, idx, payload): idx for idx, payload in items}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    result = future.result()
+                except Exception:  # noqa: BLE001
+                    result = None
+                if result is not None:
+                    results.append((idx, result))
+        results.sort(key=lambda x: x[0])
         return results
 
     def _strip_code_fences(self, text: str) -> str:
@@ -373,7 +416,7 @@ class WorkflowRunner:
             title = src.get("title") or src.get("Title") or src.get("name")
             if url is None:
                 return None
-            url_s = str(url).strip()
+            url_s = self._normalize_url(str(url))
             if not url_s:
                 return None
             return {
@@ -402,7 +445,7 @@ class WorkflowRunner:
         out: list[dict[str, object]] = []
         for idx, item in enumerate(raw_items, start=1):
             if isinstance(item, str):
-                url = item.strip()
+                url = self._normalize_url(item)
                 if url:
                     out.append(
                         {
@@ -426,7 +469,7 @@ class WorkflowRunner:
         seen: set[str] = set()
         for raw in discovery_md.splitlines():
             for m in re.finditer(r"https?://[^\s|)]+", raw):
-                url = m.group(0).strip()
+                url = self._normalize_url(m.group(0))
                 if url and url not in seen:
                     seen.add(url)
                     urls.append(url)
@@ -477,7 +520,23 @@ class WorkflowRunner:
             sections.append("## Full Page Text\n" + full_text.strip())
         return "\n\n".join(sections).strip()
 
+    def _pdf_to_text(self, pdf_bytes: bytes) -> str:
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+        except Exception:  # noqa: BLE001
+            return ""
+        pages: list[str] = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text()
+                if text and text.strip():
+                    pages.append(text.strip())
+            except Exception:  # noqa: BLE001
+                continue
+        return "\n\n".join(pages)
+
     def _fetch_source_bundle(self, url: str, timeout_s: int = 10) -> dict[str, str]:
+        url = self._normalize_url(url)
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"Invalid URL: {url}")
@@ -494,7 +553,24 @@ class WorkflowRunner:
             resp.raise_for_status()
         except requests.exceptions.Timeout as e:
             raise TimeoutError(f"Timed out after ~{timeout_s}s: {url}") from e
-        content_type = resp.headers.get("content-type", "")
+        content_type = resp.headers.get("content-type", "").lower()
+        is_pdf = (
+            "application/pdf" in content_type
+            or url.lower().rstrip("/").endswith(".pdf")
+        )
+
+        if is_pdf:
+            raw_bytes = resp.content
+            text = self._pdf_to_text(raw_bytes) or raw_bytes.decode("latin-1", errors="replace")
+            text_clean = text.replace("\r\n", "\n")
+            return {
+                "content_type": "application/pdf",
+                "raw": text,
+                "main_text": text_clean,
+                "full_text": text_clean,
+                "analysis_text": text_clean,
+            }
+
         raw = resp.text
         if "text/html" not in content_type:
             text = raw.replace("\r\n", "\n")
@@ -661,6 +737,49 @@ class WorkflowRunner:
 
     def _word_count(self, text: str) -> int:
         return len([w for w in re.split(r"\s+", text.strip()) if w])
+
+    def _retarget_markdown_word_count(
+        self,
+        client: GrokClient,
+        *,
+        markdown: str,
+        min_words: int,
+        max_words: int,
+        target_words: int,
+        context: str,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        current_words = self._word_count(markdown)
+        if min_words <= current_words <= max_words:
+            return markdown
+
+        direction = "expand" if current_words < min_words else "compress"
+        prompt = "\n".join(
+            [
+                "Revise this Markdown document to satisfy a strict total word-count target.",
+                f"Action: {direction}",
+                f"Target range: {min_words}-{max_words} words.",
+                f"Target ideal: about {target_words} words.",
+                "Requirements:",
+                "- Preserve Markdown structure and section headings.",
+                "- Preserve technical accuracy and keep the same core claims.",
+                "- Expand by adding explanations, examples, edge cases, comparisons, and implementation detail where needed.",
+                "- Compress by removing redundancy while preserving meaning.",
+                "- Do not add meta commentary about word count.",
+                "",
+                "Document:",
+                markdown,
+            ]
+        )
+        revised = self._llm_optional(
+            lambda: client.chat_text(
+                system="You are Grok.",
+                user=prompt,
+                max_output_tokens=max_output_tokens,
+            ).strip(),
+            context=context,
+        )
+        return revised if revised is not None else markdown
 
     def _youtube_source_sections(self, ctx: WorkflowContext, final_report_md: str) -> list[tuple[str, str]]:
         ignore_titles = {
@@ -1195,7 +1314,7 @@ class WorkflowRunner:
         prefetched_bundles = self._prefetch_source_bundles(sources)
 
         for i, src in enumerate(sources, start=1):
-            url = str(src.get("url", "")).strip()
+            url = self._normalize_url(str(src.get("url", "")))
             title = str(src.get("title", f"source-{i}")).strip()
             if not url:
                 continue
@@ -1217,7 +1336,13 @@ class WorkflowRunner:
                     f"- Credibility: {src.get('credibility', 'unknown')}",
                 ]
             )
-            raw_suffix = ".html" if "text/html" in bundle.get("content_type", "") else ".txt"
+            ct = bundle.get("content_type", "")
+            if "text/html" in ct:
+                raw_suffix = ".html"
+            elif "application/pdf" in ct:
+                raw_suffix = ".pdf"
+            else:
+                raw_suffix = ".txt"
             self._write(run_snapshot_dir / f"{base_name}_raw{raw_suffix}", bundle["raw"])
             self._write(session_snapshot_dir / f"{base_name}_raw{raw_suffix}", bundle["raw"])
             source_text = "\n\n".join(
@@ -1237,8 +1362,9 @@ class WorkflowRunner:
                 max_chars=self.SOURCE_CHUNK_CHARS,
                 overlap_chars=self.SOURCE_CHUNK_OVERLAP,
             )
-            chunk_sections: list[str] = []
-            for chunk_idx, chunk in enumerate(chunks, start=1):
+            chunk_jobs = [(chunk_idx, chunk) for chunk_idx, chunk in enumerate(chunks, start=1)]
+
+            def extract_one_chunk(chunk_idx: int, chunk: str) -> str | None:
                 user_prompt = client.render_template(
                     template,
                     {
@@ -1256,11 +1382,20 @@ class WorkflowRunner:
                     context=f"Extraction chunk {chunk_idx}/{len(chunks)} for source {i}",
                 )
                 if extracted_chunk is None:
-                    continue
+                    return None
                 chunk_path = run_chunk_dir / f"{base_name}_chunk_{chunk_idx:02d}.md"
                 self._write(chunk_path, extracted_chunk)
                 self._write(session_chunk_dir / f"{base_name}_chunk_{chunk_idx:02d}.md", extracted_chunk)
-                chunk_sections.append(f"## Chunk {chunk_idx} of {len(chunks)}\n\n{extracted_chunk.strip()}")
+                return f"## Chunk {chunk_idx} of {len(chunks)}\n\n{extracted_chunk.strip()}"
+
+            chunk_sections = [
+                section
+                for _, section in self._parallel_map_ordered(
+                    chunk_jobs,
+                    max_workers=self.EXTRACTION_WORKERS,
+                    fn=extract_one_chunk,
+                )
+            ]
 
             if not chunk_sections:
                 self.console.print(f"[yellow]No extraction chunks completed for source {i}. Skipping source dossier.[/yellow]")
@@ -1346,8 +1481,9 @@ class WorkflowRunner:
         drafted_sections: list[str] = []
         for section_name in self.REPORT_SECTIONS:
             section_slug = self._slug(section_name)
-            evidence_packets: list[str] = []
-            for chunk_idx, chunk in enumerate(notebook_chunks, start=1):
+            evidence_jobs = [(chunk_idx, chunk) for chunk_idx, chunk in enumerate(notebook_chunks, start=1)]
+
+            def build_evidence_packet(chunk_idx: int, chunk: str) -> str | None:
                 evidence_prompt = client.render_template(
                     evidence_template,
                     {
@@ -1364,11 +1500,20 @@ class WorkflowRunner:
                     context=f"Evidence packet {chunk_idx}/{len(notebook_chunks)} for section {section_name}",
                 )
                 if evidence_md is None:
-                    continue
-                evidence_packets.append(f"### Evidence Packet {chunk_idx}\n\n{evidence_md.strip()}")
+                    return None
                 packet_name = f"{section_slug}_chunk_{chunk_idx:02d}.md"
                 self._write(section_evidence_dir / packet_name, evidence_md)
                 self._write(session_evidence_dir / packet_name, evidence_md)
+                return f"### Evidence Packet {chunk_idx}\n\n{evidence_md.strip()}"
+
+            evidence_packets = [
+                packet
+                for _, packet in self._parallel_map_ordered(
+                    evidence_jobs,
+                    max_workers=self.EVIDENCE_WORKERS,
+                    fn=build_evidence_packet,
+                )
+            ]
 
             if not evidence_packets:
                 self.console.print(f"[yellow]No evidence packets completed for section '{section_name}'. Skipping section.[/yellow]")
@@ -1577,6 +1722,34 @@ class WorkflowRunner:
         draft_body = latest_draft
         if draft_body.startswith("# "):
             draft_body = "\n".join(draft_body.splitlines()[1:]).strip()
+        fixed_parts = [
+            f"# Final Research Report: {ctx.state.topic}",
+            "## Executive Summary",
+            executive_summary,
+            "## Source Catalog",
+            source_catalog,
+            "## Knowledge Base Overview" if knowledge_outline and "No knowledge-base artifacts available yet." not in knowledge_outline else "",
+            knowledge_outline if knowledge_outline and "No knowledge-base artifacts available yet." not in knowledge_outline else "",
+            "## Glossary",
+            glossary,
+        ]
+        fixed_words = self._word_count("\n\n".join(part for part in fixed_parts if part.strip()))
+        target_body_words = max(
+            6000,
+            min(
+                9500,
+                self.FINAL_REPORT_TARGET_WORDS - fixed_words,
+            ),
+        )
+        draft_body = self._retarget_markdown_word_count(
+            client,
+            markdown=draft_body,
+            min_words=max(5000, self.FINAL_REPORT_MIN_WORDS - fixed_words),
+            max_words=max(6500, self.FINAL_REPORT_MAX_WORDS - fixed_words),
+            target_words=target_body_words,
+            context="Final report body expansion/compression",
+            max_output_tokens=50000,
+        )
         final_parts = [
             f"# Final Research Report: {ctx.state.topic}",
             self._build_toc(draft_body),
@@ -1590,6 +1763,15 @@ class WorkflowRunner:
             final_parts.extend(["## Knowledge Base Overview", knowledge_outline])
         final_parts.extend(["## Glossary", glossary])
         final_md = "\n\n".join(part for part in final_parts if part.strip())
+        final_md = self._retarget_markdown_word_count(
+            client,
+            markdown=final_md,
+            min_words=self.FINAL_REPORT_MIN_WORDS,
+            max_words=self.FINAL_REPORT_MAX_WORDS,
+            target_words=self.FINAL_REPORT_TARGET_WORDS,
+            context="Final report word-count correction",
+            max_output_tokens=50000,
+        )
         self._write(ctx.run_dir / "FINAL_REPORT.md", final_md)
         self._write(ctx.session_dir / "FINAL_REPORT.md", final_md)
 

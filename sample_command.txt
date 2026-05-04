@@ -1,8 +1,8 @@
 cd C:\Project\research_agent\grok-research-agent\
 
-grok-research-agent start --topic "X" --auto --trace-llm 
+grok-research-agent start --topic "X" --auto --trace-llm --final-min-words 9000
 
-grok-research-agent resume --session-id <your-session-id> --auto or
+grok-research-agent resume --session-id <your-session-id> --auto 
 
 grok-research-agent resume --session-id <your-session-id>
 
@@ -14,6 +14,6 @@ grok-research-agent start --topic "Design and implement a comprehensive multi-ag
 
 grok-research-agent start --topic "Design and implement a complete software system following a rigorous spec-driven development process that mandates: (1) creation of a formal, version-controlled specification document containing functional requirements, non-functional requirements, user stories, acceptance criteria, API contracts, data models, and sequence diagrams; (2) enforcement of a mandatory spec-review gate where at least two senior engineers must approve the spec before any code is written; (3) use of specification-derived behavior-driven development (BDD) scenarios written in Gherkin that serve as both acceptance tests and living documentation; (4) continuous validation through a CI pipeline that fails the build if any BDD scenario is violated or if code coverage drops below 85%; (5) adoption of industry-standard tools including OpenAPI 3.1 for API specifications, AsyncAPI for event specifications, JSON Schema for data validation, PlantUML or Mermaid for diagramming, SpecFlow/Cucumber for BDD, and Swagger-Codegen or OpenAPI Generator to auto-produce client/server stubs; (6) traceability matrix that maps every requirement in the spec to at least one automated test and one source file; (7) zero-tolerance policy for code that cannot be traced back to an approved specification change; (8) final verification stage where the delivered artifact is validated against the original spec via automated acceptance tests, performance benchmarks, security scans, and a formal sign-off checklist signed by product owner, tech lead, and QA lead." --auto --trace-llm 
 
-grok-research-agent start --topic "Design and implement a verifiable, profitable real-time AI-driven trading system that ingests multi-asset market data at microsecond latency, trains and deploys predictive models with online learning, enforces strict risk-management rules (max drawdown ≤ 5 %, Sharpe ratio ≥ 2.0), provides immutable audit trails for every order decision, and delivers net-positive returns after transaction costs across at least 250 live trading days with statistical significance (p-value < 0.05)." --auto --trace-llm 
+grok-research-agent start --topic "Design and implement a verifiable, profitable real-time AI-driven trading system that ingests multi-asset market data at microsecond latency, trains and deploys predictive models with online learning, enforces strict risk-management rules (max drawdown ≤ 5 %, Sharpe ratio ≥ 2.0), provides immutable audit trails for every order decision, and delivers net-positive returns after transaction costs across at least 250 live trading days with statistical significance (p-value < 0.05)."  --auto --trace-llm 
 
 grok-research-agent resume --session-id design-and-implement-a-verifiable-profitable-real-time-ai-dr-875ad28f-20260502
